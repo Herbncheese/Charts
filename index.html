@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0b0e11" />
+  <title>Oscar Charts — Live Crypto</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header class="header">
+      <div class="brand">
+        <div class="brand-mark">Oc</div>
+        <div class="brand-text">Oscar Charts<span>live</span></div>
+      </div>
+
+      <div class="price-block">
+        <span class="symbol-label" id="symbolLabel">BTCUSDT</span>
+        <span class="last-price" id="lastPrice">—</span>
+        <span class="change-pill" id="changePill">—</span>
+      </div>
+
+      <div class="meta-stats" id="metaStats">
+        <div class="stat">24h H<strong id="high24">—</strong></div>
+        <div class="stat">24h L<strong id="low24">—</strong></div>
+        <div class="stat">Vol<strong id="vol24">—</strong></div>
+      </div>
+
+      <div class="header-actions">
+        <button type="button" class="icon-btn" id="copilotToggle" aria-label="Open chart co-pilot" title="Chart co-pilot">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
+        <div class="status" id="connStatus" title="WebSocket status">
+          <span class="status-dot"></span>
+          <span id="connLabel">connecting</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="error-banner" id="errorBanner"></div>
+
+    <div class="toolbar">
+      <div class="view-toggle" id="viewToggle" role="group" aria-label="View mode">
+        <button type="button" class="view-btn active" data-view="chart">Chart</button>
+        <button type="button" class="view-btn" data-view="heatmap">Heatmap</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="control-group chart-only">
+        <span class="control-label">Symbol</span>
+        <select id="symbolSelect" aria-label="Trading pair">
+          <option value="BTCUSDT">BTC / USDT</option>
+          <option value="ETHUSDT">ETH / USDT</option>
+          <option value="SOLUSDT">SOL / USDT</option>
+          <option value="XRPUSDT">XRP / USDT</option>
+          <option value="BNBUSDT">BNB / USDT</option>
+          <option value="DOGEUSDT">DOGE / USDT</option>
+          <option value="ADAUSDT">ADA / USDT</option>
+          <option value="AVAXUSDT">AVAX / USDT</option>
+          <option value="LINKUSDT">LINK / USDT</option>
+          <option value="POLUSDT">POL / USDT</option>
+          <option value="DOTUSDT">DOT / USDT</option>
+          <option value="LTCUSDT">LTC / USDT</option>
+          <option value="UNIUSDT">UNI / USDT</option>
+          <option value="ATOMUSDT">ATOM / USDT</option>
+          <option value="NEARUSDT">NEAR / USDT</option>
+        </select>
+      </div>
+
+      <div class="divider chart-only"></div>
+
+      <div class="control-group chart-only">
+        <span class="control-label">Timeframe</span>
+        <div class="tf-group" id="tfGroup" role="group" aria-label="Timeframe">
+          <button type="button" class="tf-btn" data-tf="1m">1m</button>
+          <button type="button" class="tf-btn" data-tf="5m">5m</button>
+          <button type="button" class="tf-btn" data-tf="15m">15m</button>
+          <button type="button" class="tf-btn active" data-tf="1h">1h</button>
+          <button type="button" class="tf-btn" data-tf="4h">4h</button>
+          <button type="button" class="tf-btn" data-tf="1d">1D</button>
+        </div>
+      </div>
+
+      <div class="indicator-toggles chart-only" id="indToggles">
+        <button type="button" class="ind-toggle active" data-ind="sma" aria-pressed="true">
+          <span class="swatch"></span>SMA 20
+        </button>
+        <button type="button" class="ind-toggle active" data-ind="ema" aria-pressed="true">
+          <span class="swatch"></span>EMA 50
+        </button>
+        <button type="button" class="ind-toggle active" data-ind="vol" aria-pressed="true">
+          <span class="swatch"></span>Vol
+        </button>
+        <button type="button" class="ind-toggle" data-ind="rsi" aria-pressed="false">
+          <span class="swatch"></span>RSI 14
+        </button>
+        <button type="button" class="ind-toggle" data-ind="macd" aria-pressed="false">
+          <span class="swatch"></span>MACD
+        </button>
+      </div>
+    </div>
+
+    <div class="workspace">
+      <div class="main-column">
+        <main class="charts" id="chartsView">
+          <section class="chart-pane price">
+            <div class="pane-label">Price</div>
+            <div class="chart-container" id="priceChart"></div>
+            <div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
+          </section>
+          <section class="chart-pane rsi" id="rsiPane">
+            <div class="pane-label">RSI (14)</div>
+            <div class="chart-container" id="rsiChart"></div>
+          </section>
+          <section class="chart-pane macd" id="macdPane">
+            <div class="pane-label">MACD (12, 26, 9)</div>
+            <div class="chart-container" id="macdChart"></div>
+          </section>
+        </main>
+
+        <section class="heatmap-view" id="heatmapView" hidden>
+          <div class="heatmap-header">
+            <h2>24h % Heatmap</h2>
+            <span class="heatmap-meta" id="heatmapMeta">Loading…</span>
+          </div>
+          <div class="heatmap-grid" id="heatmapGrid" role="list"></div>
+          <p class="heatmap-note">Tap a tile to open that pair on the chart. Data from Binance public 24hr ticker. Educational only.</p>
+        </section>
+      </div>
+
+      <aside class="copilot" id="copilot" aria-label="Chart co-pilot">
+        <div class="copilot-header">
+          <div>
+            <h2>Chart co-pilot</h2>
+            <p class="copilot-sub">Learning partner · rule-based · not advice</p>
+          </div>
+          <button type="button" class="icon-btn" id="copilotClose" aria-label="Close co-pilot">✕</button>
+        </div>
+
+        <div class="copilot-disclaimer">
+          Hypothetical / educational only. Uses loaded candles &amp; indicators in your browser. Never financial advice or a guarantee.
+        </div>
+
+        <div class="copilot-presets" id="copilotPresets">
+          <button type="button" data-prompt="trend">What's the trend?</button>
+          <button type="button" data-prompt="project">Project next few candles (hypothetical)</button>
+          <button type="button" data-prompt="explain">Explain RSI/MACD on this chart</button>
+          <button type="button" data-prompt="invalidate">What would invalidate this move?</button>
+        </div>
+
+        <div class="copilot-messages" id="copilotMessages" role="log" aria-live="polite"></div>
+
+        <form class="copilot-input-row" id="copilotForm">
+          <input type="text" id="copilotInput" placeholder="Ask about this chart…" autocomplete="off" maxlength="280" />
+          <button type="submit" class="btn primary">Ask</button>
+        </form>
+
+        <div class="study-notes">
+          <div class="study-notes-head">
+            <h3>Study notes</h3>
+            <button type="button" class="link-btn" id="clearNotes">Clear</button>
+          </div>
+          <ul id="studyNotesList"></ul>
+          <button type="button" class="btn ghost" id="saveObservation">Save last observation</button>
+        </div>
+      </aside>
+    </div>
+
+    <div class="copilot-backdrop" id="copilotBackdrop" hidden></div>
+
+    <footer class="footer">
+      <span>Data: Binance public API · No keys · Client-side only · <strong>Educational / not financial advice</strong></span>
+      <span>Oscar Charts · lightweight-charts</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
