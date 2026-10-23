@@ -78,3 +78,27 @@ http://localhost:8765/?view=heatmap
 curl -sS "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
 node --check app.js   # syntax check if node is available
 ```
+
+## Lab: backtest + extra readouts (added Oct 2026)
+
+Tap **Lab / Backtest** in the indicator toolbar to open the panel under the charts (on phones the column scrolls).
+
+### Backtest (educational)
+- Strategies: SMA20/EMA50 cross, RSI 30/70 reversion (cross back up through 30 / down through 70), MACD/signal cross, Bollinger squeeze breakout (band width in the bottom 20% of the last 120 bars within the prior 5 bars, then a close outside the bands), VWAP reclaim (close crosses session VWAP).
+- Runs on loaded history (now 1000 candles, Binance's max per request), skipping a 50-bar warm-up. Long only by default; **Allow shorts** adds short entries on opposite signals.
+- Signals are taken on the bar close, entries at the **next bar's open**. ATR(14, Wilder) stop and target (default 1.5× / 3×, editable). If both are hit in the same bar, the stop is assumed (conservative). Gaps through a level fill at the open. Opposite signals exit at the next open, and open trades close at the last bar.
+- Fees: 0.1% per side. No slippage, funding, or liquidity modelling.
+- Output: trades, win rate, net % (compounded, full allocation), buy & hold, the difference vs B&H, max drawdown (mark-to-market), profit factor, average win and loss, an equity curve vs B&H (start = 100), and trade markers on the main chart (labels are hidden when there are more than 40 trades).
+- A warning appears when there are **fewer than 30 trades**. An in-sample/out-of-sample split shows the first half vs the second half of the window.
+
+### New indicator toggles and readouts
+- **VWAP**: anchored to each UTC day. On 1D candles a daily anchor is meaningless, so it falls back to a rolling 20-bar VWAP.
+- **BB 20,2**: Bollinger Bands.
+- **Vol profile**: a canvas overlay showing volume by price for the visible candles (28 bins). The point of control is highlighted.
+- **ATR(14)** readout with a 1.5× ATR stop distance for longs and shorts.
+- **Funding / open interest** from `fapi.binance.com/fapi/v1/premiumIndex` and `/fapi/v1/openInterest`. If CORS, a geo-block (HTTP 451), or a missing perp blocks them, the readout shows "not available".
+- **Order book** from `/api/v3/depth?limit=1000` (with the same REST fallback as the rest of the app). Shows the biggest bid and ask walls within ±2% of mid and the total $ depth on each side.
+- Funding, OI, and depth refresh every 30 s.
+
+### Co-pilot
+New presets: "Read the new data" and "Summarize my backtest". Free-text questions about funding, OI, depth/walls, VWAP, Bollinger, squeeze, ATR, profile, or backtest get routed to them. The trend and invalidation replies also cite VWAP, funding, ATR, and walls when those are available. Everything stays educational and hypothetical, with no guarantees.

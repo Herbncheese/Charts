@@ -107,6 +107,18 @@
         <button type="button" class="ind-toggle" data-ind="macd" aria-pressed="false">
           <span class="swatch"></span>MACD
         </button>
+        <button type="button" class="ind-toggle" data-ind="vwap" aria-pressed="false">
+          <span class="swatch"></span>VWAP
+        </button>
+        <button type="button" class="ind-toggle" data-ind="bb" aria-pressed="false">
+          <span class="swatch"></span>BB 20,2
+        </button>
+        <button type="button" class="ind-toggle" data-ind="vp" aria-pressed="false">
+          <span class="swatch"></span>Vol profile
+        </button>
+        <button type="button" class="ind-toggle lab-toggle" id="labToggle" aria-pressed="false">
+          <span class="swatch"></span>Lab / Backtest
+        </button>
       </div>
     </div>
 
@@ -127,6 +139,33 @@
             <div class="chart-container" id="macdChart"></div>
           </section>
         </main>
+
+        <section class="lab" id="labPanel" hidden aria-label="Readouts and backtest">
+          <div class="readouts">
+            <div class="ro"><span>ATR 14</span><strong id="roAtr">—</strong></div>
+            <div class="ro"><span>Funding (perp)</span><strong id="roFunding">…</strong></div>
+            <div class="ro"><span>Open interest</span><strong id="roOi">…</strong></div>
+            <div class="ro"><span>Bid wall ±2%</span><strong id="roBidWall" class="pos">…</strong></div>
+            <div class="ro"><span>Ask wall ±2%</span><strong id="roAskWall" class="neg">…</strong></div>
+            <div class="ro"><span>Depth ±2%</span><strong id="roDepthImb">…</strong></div>
+          </div>
+          <div class="backtest">
+            <div class="bt-controls">
+              <h3>Backtest</h3>
+              <select id="btStrategy" aria-label="Strategy"></select>
+              <label class="bt-num">Stop×ATR <input type="number" id="btStop" value="1.5" min="0.2" max="10" step="0.1" inputmode="decimal" /></label>
+              <label class="bt-num">Target×ATR <input type="number" id="btTarget" value="3" min="0.2" max="20" step="0.1" inputmode="decimal" /></label>
+              <label class="bt-check"><input type="checkbox" id="btShort" /> Allow shorts</label>
+              <button type="button" class="btn primary" id="btRun">Run</button>
+              <button type="button" class="btn ghost" id="btClear">Clear</button>
+            </div>
+            <div class="bt-results" id="btResults"></div>
+            <div class="bt-equity-wrap" id="btEquityWrap" hidden>
+              <div class="pane-label static">Equity (strategy vs buy &amp; hold, start = 100)</div>
+              <div id="btEquity" class="bt-equity"></div>
+            </div>
+          </div>
+        </section>
 
         <section class="heatmap-view" id="heatmapView" hidden>
           <div class="heatmap-header">
@@ -156,6 +195,8 @@
           <button type="button" data-prompt="project">Project next few candles (hypothetical)</button>
           <button type="button" data-prompt="explain">Explain RSI/MACD on this chart</button>
           <button type="button" data-prompt="invalidate">What would invalidate this move?</button>
+          <button type="button" data-prompt="readouts">Read the new data</button>
+          <button type="button" data-prompt="backtest">Summarize my backtest</button>
         </div>
 
         <div class="copilot-messages" id="copilotMessages" role="log" aria-live="polite"></div>

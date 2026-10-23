@@ -16,7 +16,7 @@
     "wss://data-stream.binance.vision/ws",
   ];
 
-  const KLINE_LIMIT = 500;
+  const KLINE_LIMIT = 1000; // Binance max per request; also used by the backtester
   const RECONNECT_MS = 2000;
   const RECONNECT_MAX_MS = 30000;
   const HEATMAP_REFRESH_MS = 12000;
@@ -63,7 +63,7 @@
     symbol: "BTCUSDT",
     interval: "1h",
     view: "chart",
-    indicators: { sma: true, ema: true, vol: true, rsi: false, macd: false },
+    indicators: { sma: true, ema: true, vol: true, rsi: false, macd: false, vwap: false, bb: false, vp: false },
     candles: [],
     restBase: REST_BASES[0],
     wsBase: WS_BASES[0],
@@ -230,6 +230,7 @@
         });
       });
     };
+    createExtSeries();
     sync(priceChart, [rsiChart, macdChart]);
     sync(rsiChart, [priceChart, macdChart]);
     sync(macdChart, [priceChart, rsiChart]);
@@ -399,6 +400,7 @@
       }
       macdHistSeries.setData(histData);
     }
+    applyExtIndicators();
   }
 
   // ── Formatting ──────────────────────────────────────────────────────────
@@ -566,6 +568,8 @@
       });
 
       candleSeries.setData(state.candles);
+      candleSeries.setMarkers([]);
+      if (ext.lastBacktest) clearBacktest();
       applyIndicators();
       priceChart.timeScale().fitContent();
 
@@ -790,6 +794,7 @@
     if (token !== state.loadToken) return;
     connectWs();
     startTickerLoop();
+    startExtras();
   }
 
   // ── Co-pilot (rule-based, educational) ──────────────────────────────────
@@ -899,6 +904,7 @@
       range50,
       change24: state.lastTicker ? parseFloat(state.lastTicker.priceChangePercent) : null,
       candleCount: candles.length,
+      ext: extAnalysis(),
     };
   }
 
@@ -916,6 +922,8 @@
     if (a.range20) {
       text += "Recent 20-bar range: " + fmtPrice(a.range20.low) + " – " + fmtPrice(a.range20.high) + ".\n";
     }
+    if (a.ext.vwap != null) text += "VWAP: " + fmtPrice(a.ext.vwap) + " (price " + (a.price >= a.ext.vwap ? "above" : "below") + ").\n";
+    if (a.ext.funding) text += "Funding: " + (a.ext.funding.rate * 100).toFixed(4) + "%/8h.\n";
     text += "\nThis is a snapshot of moving averages vs price — not a forecast.";
     return text + disclaimerFooter();
   }
@@ -993,12 +1001,16 @@
     if (a.macdCross) {
       text += "\nAlso watch: a MACD cross opposite to the last one can challenge the momentum story.";
     }
+    if (a.ext.atrW != null) text += "\nVolatility yardstick: ATR(14) ≈ " + fmtPrice(a.ext.atrW) + "; levels closer than ~1× ATR are often noise.";
+    if (a.ext.depth && a.ext.depth.bid && a.ext.depth.ask) text += "\nOrder-book walls (±2%): bid " + fmtPrice(a.ext.depth.bid.price) + " / ask " + fmtPrice(a.ext.depth.ask.price) + " — can vanish instantly.";
     text += "\nInvalidation levels are learning tools, not stop-loss instructions.";
     return text + disclaimerFooter();
   }
 
   function replyGeneric(a, q) {
     const lower = q.toLowerCase();
+    if (/backtest|strategy|win rate|drawdown/.test(lower)) return replyBacktest(a);
+    if (/funding|open interest|\boi\b|depth|wall|order ?book|vwap|bollinger|\bbb\b|squeeze|profile|readout|atr/.test(lower)) return replyReadouts(a);
     if (/trend|direction|bias/.test(lower)) return replyTrend(a);
     if (/project|forecast|predict|next|scenario|outcome|atr|volatil/.test(lower)) return replyProject(a);
     if (/rsi|macd|indicator|explain|oscillator/.test(lower)) return replyExplain(a);
@@ -1055,6 +1067,8 @@
       else if (key === "project") reply = replyProject(a);
       else if (key === "explain") reply = replyExplain(a);
       else if (key === "invalidate") reply = replyInvalidate(a);
+      else if (key === "readouts") reply = replyReadouts(a);
+      else if (key === "backtest") reply = replyBacktest(a);
       else reply = replyGeneric(a, q);
     }
     state.lastCopilotReply = reply;
@@ -1067,6 +1081,8 @@
     if (lower.indexOf("project next") !== -1 || lower.indexOf("hypothetical") !== -1) return "project";
     if (lower.indexOf("explain rsi") !== -1 || lower.indexOf("explain macd") !== -1) return "explain";
     if (lower.indexOf("invalidate") !== -1) return "invalidate";
+    if (lower.indexOf("read the new data") !== -1) return "readouts";
+    if (lower.indexOf("summarize my backtest") !== -1) return "backtest";
     return null;
   }
 
@@ -1151,6 +1167,588 @@
     renderNotes();
   }
 
+
+  // ══ Extensions: VWAP, Bollinger, ATR, volume profile, derivs, depth, backtest ══
+  const FAPI_BASE = "https://fapi.binance.com";
+  const FEE = 0.001; // 0.1% per side
+  const EXTRAS_REFRESH_MS = 30000;
+  const ext = {
+    vwapSeries: null, bbUpper: null, bbMid: null, bbLower: null,
+    vpCanvas: null, vpRaf: 0,
+    funding: null, oi: null, derivStatus: "loading", depth: null, depthStatus: "loading",
+    extrasTimer: null, extrasToken: 0,
+    eqChart: null, eqSeries: null, bhSeries: null,
+    lastBacktest: null,
+  };
+
+  function createExtSeries() {
+    const base = { lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false };
+    ext.vwapSeries = priceChart.addLineSeries({ ...base, color: "#00bcd4", lineWidth: 1.5, title: "VWAP", visible: false });
+    ext.bbUpper = priceChart.addLineSeries({ ...base, color: "rgba(100,181,246,0.8)", title: "BB", visible: false });
+    ext.bbMid = priceChart.addLineSeries({ ...base, color: "rgba(100,181,246,0.4)", lineStyle: LightweightCharts.LineStyle.Dotted, visible: false });
+    ext.bbLower = priceChart.addLineSeries({ ...base, color: "rgba(100,181,246,0.8)", visible: false });
+
+    const cv = document.createElement("canvas");
+    cv.className = "vp-canvas";
+    els.priceChart.parentElement.appendChild(cv);
+    ext.vpCanvas = cv;
+    priceChart.timeScale().subscribeVisibleLogicalRangeChange(scheduleVolumeProfile);
+  }
+
+  // ── Indicator math ──
+  function trueRanges(candles) {
+    return candles.map((c, i) => {
+      const p = i ? candles[i - 1].close : c.close;
+      return Math.max(c.high - c.low, Math.abs(c.high - p), Math.abs(c.low - p));
+    });
+  }
+  function atrSeries(candles, period) {
+    const tr = trueRanges(candles);
+    const out = new Array(candles.length).fill(null);
+    if (candles.length <= period) return out;
+    let a = 0;
+    for (let i = 1; i <= period; i++) a += tr[i];
+    a /= period;
+    out[period] = a;
+    for (let i = period + 1; i < candles.length; i++) {
+      a = (a * (period - 1) + tr[i]) / period; // Wilder
+      out[i] = a;
+    }
+    return out;
+  }
+  function bollinger(closes, period, mult) {
+    const n = closes.length;
+    const mid = new Array(n).fill(null), up = new Array(n).fill(null), lo = new Array(n).fill(null), bw = new Array(n).fill(null);
+    for (let i = period - 1; i < n; i++) {
+      let s = 0;
+      for (let j = i - period + 1; j <= i; j++) s += closes[j];
+      const m = s / period;
+      let v = 0;
+      for (let j = i - period + 1; j <= i; j++) v += (closes[j] - m) ** 2;
+      const sd = Math.sqrt(v / period);
+      mid[i] = m; up[i] = m + mult * sd; lo[i] = m - mult * sd;
+      bw[i] = m ? (up[i] - lo[i]) / m : null;
+    }
+    return { mid, up, lo, bw };
+  }
+  // Session VWAP anchored to each UTC day. On 1D candles a daily anchor is a single bar,
+  // so we fall back to a rolling 20-bar VWAP there (noted in the UI/README).
+  function vwapSeriesCalc(candles, interval) {
+    const out = new Array(candles.length).fill(null);
+    if (interval === "1d") {
+      for (let i = 19; i < candles.length; i++) {
+        let pv = 0, v = 0;
+        for (let j = i - 19; j <= i; j++) {
+          const c = candles[j];
+          pv += ((c.high + c.low + c.close) / 3) * c.volume; v += c.volume;
+        }
+        out[i] = v ? pv / v : null;
+      }
+      return out;
+    }
+    let day = null, pv = 0, v = 0;
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+      const d = Math.floor(c.time / 86400);
+      if (d !== day) { day = d; pv = 0; v = 0; }
+      pv += ((c.high + c.low + c.close) / 3) * c.volume;
+      v += c.volume;
+      out[i] = v ? pv / v : c.close;
+    }
+    return out;
+  }
+
+  function applyExtIndicators() {
+    if (!ext.vwapSeries) return;
+    const candles = state.candles;
+    const times = candles.map((c) => c.time);
+    const closes = candles.map((c) => c.close);
+    if (state.indicators.vwap) {
+      ext.vwapSeries.setData(toLineData(times, vwapSeriesCalc(candles, state.interval)));
+      ext.vwapSeries.applyOptions({ visible: true });
+    } else {
+      ext.vwapSeries.setData([]);
+      ext.vwapSeries.applyOptions({ visible: false });
+    }
+    const bbOn = state.indicators.bb;
+    if (bbOn) {
+      const b = bollinger(closes, 20, 2);
+      ext.bbUpper.setData(toLineData(times, b.up));
+      ext.bbMid.setData(toLineData(times, b.mid));
+      ext.bbLower.setData(toLineData(times, b.lo));
+    } else {
+      ext.bbUpper.setData([]); ext.bbMid.setData([]); ext.bbLower.setData([]);
+    }
+    [ext.bbUpper, ext.bbMid, ext.bbLower].forEach((s) => s.applyOptions({ visible: bbOn }));
+    updateAtrReadout();
+    scheduleVolumeProfile();
+  }
+
+  // ── Volume profile (canvas overlay) ──
+  function scheduleVolumeProfile() {
+    if (ext.vpRaf) return;
+    ext.vpRaf = requestAnimationFrame(() => { ext.vpRaf = 0; drawVolumeProfile(); });
+  }
+  function drawVolumeProfile() {
+    const cv = ext.vpCanvas;
+    if (!cv) return;
+    const host = els.priceChart;
+    const w = host.clientWidth, h = host.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    cv.style.width = w + "px"; cv.style.height = h + "px";
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    const ctx = cv.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!state.indicators.vp || !state.candles.length) return;
+    const range = priceChart.timeScale().getVisibleLogicalRange();
+    const n = state.candles.length;
+    let a = 0, b = n - 1;
+    if (range) { a = Math.max(0, Math.floor(range.from)); b = Math.min(n - 1, Math.ceil(range.to)); }
+    const slice = state.candles.slice(a, b + 1);
+    if (slice.length < 2) return;
+    let lo = Infinity, hi = -Infinity;
+    for (const c of slice) { if (c.low < lo) lo = c.low; if (c.high > hi) hi = c.high; }
+    if (!(hi > lo)) return;
+    const BINS = 28;
+    const bins = new Array(BINS).fill(0);
+    const step = (hi - lo) / BINS;
+    for (const c of slice) {
+      // spread each candle's volume evenly across the bins its high-low range touches
+      const i0 = Math.min(BINS - 1, Math.floor((c.low - lo) / step));
+      const i1 = Math.min(BINS - 1, Math.floor((c.high - lo) / step));
+      const share = c.volume / (i1 - i0 + 1);
+      for (let i = i0; i <= i1; i++) bins[i] += share;
+    }
+    const maxV = Math.max(...bins);
+    let poc = bins.indexOf(maxV);
+    let scaleW = 60;
+    try { scaleW = priceChart.priceScale("right").width() || 60; } catch (_) { /* ignore */ }
+    const right = w - scaleW - 2;
+    const maxLen = Math.min(140, (w - scaleW) * 0.28);
+    for (let i = 0; i < BINS; i++) {
+      const yTop = candleSeries.priceToCoordinate(lo + (i + 1) * step);
+      const yBot = candleSeries.priceToCoordinate(lo + i * step);
+      if (yTop == null || yBot == null) continue;
+      const len = (bins[i] / maxV) * maxLen;
+      ctx.fillStyle = i === poc ? "rgba(240,185,11,0.45)" : "rgba(91,107,124,0.32)";
+      ctx.fillRect(right - len, Math.min(yTop, yBot) + 0.5, len, Math.max(1, Math.abs(yBot - yTop) - 1));
+    }
+    ext.vpPoc = lo + (poc + 0.5) * step;
+  }
+
+  // ── Readouts ──
+  function updateAtrReadout() {
+    const el = $("roAtr");
+    if (!el) return;
+    const a = lastDefined(atrSeries(state.candles, 14));
+    const last = state.candles[state.candles.length - 1];
+    if (!a || !last) { el.textContent = "—"; return; }
+    const pct = (a.value / last.close) * 100;
+    el.innerHTML = "";
+    el.append(fmtPrice(a.value) + " (" + pct.toFixed(2) + "%)");
+    const sub = document.createElement("small");
+    sub.textContent = "1.5× ATR stop ≈ " + fmtPrice(1.5 * a.value) + " → long " + fmtPrice(last.close - 1.5 * a.value) + " / short " + fmtPrice(last.close + 1.5 * a.value);
+    el.appendChild(sub);
+  }
+
+  async function fetchWithTimeout(url, ms) {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const t = ctrl ? setTimeout(() => ctrl.abort(), ms) : null;
+    try {
+      const res = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    } finally { if (t) clearTimeout(t); }
+  }
+
+  async function refreshDerivs(token) {
+    const sym = state.symbol;
+    const [pi, oi] = await Promise.allSettled([
+      fetchWithTimeout(`${FAPI_BASE}/fapi/v1/premiumIndex?symbol=${sym}`, 8000),
+      fetchWithTimeout(`${FAPI_BASE}/fapi/v1/openInterest?symbol=${sym}`, 8000),
+    ]);
+    if (token !== ext.extrasToken) return;
+    ext.funding = pi.status === "fulfilled" && pi.value && pi.value.lastFundingRate != null
+      ? { rate: parseFloat(pi.value.lastFundingRate), mark: parseFloat(pi.value.markPrice), next: pi.value.nextFundingTime } : null;
+    ext.oi = oi.status === "fulfilled" && oi.value && oi.value.openInterest != null
+      ? { qty: parseFloat(oi.value.openInterest) } : null;
+    ext.derivStatus = ext.funding || ext.oi ? "ok" : "na";
+    if (!ext.funding && !ext.oi) console.warn("Futures endpoints not available", pi.reason || "", oi.reason || "");
+    renderDerivs();
+  }
+  function renderDerivs() {
+    const f = $("roFunding"), o = $("roOi");
+    if (!f || !o) return;
+    f.classList.remove("pos", "neg");
+    if (ext.funding) {
+      const pct = ext.funding.rate * 100;
+      f.textContent = (pct >= 0 ? "+" : "") + pct.toFixed(4) + "% / 8h";
+      f.classList.add(pct >= 0 ? "pos" : "neg");
+    } else f.textContent = ext.derivStatus === "loading" ? "…" : "not available";
+    if (ext.oi) {
+      const px = (ext.funding && ext.funding.mark) || state.lastPrice;
+      o.textContent = fmtVol(ext.oi.qty) + " " + state.symbol.replace("USDT", "") + (px ? " (≈$" + fmtVol(ext.oi.qty * px) + ")" : "");
+    } else o.textContent = ext.derivStatus === "loading" ? "…" : "not available";
+  }
+
+  async function refreshDepth(token) {
+    try {
+      const d = await fetchJson(`/api/v3/depth?symbol=${state.symbol}&limit=1000`);
+      if (token !== ext.extrasToken) return;
+      const bestBid = parseFloat(d.bids[0][0]), bestAsk = parseFloat(d.asks[0][0]);
+      const mid = (bestBid + bestAsk) / 2;
+      const pick = (side, inRange) => {
+        let best = null, total = 0;
+        for (const [p, q] of side) {
+          const price = parseFloat(p), qty = parseFloat(q);
+          if (!inRange(price)) continue;
+          total += price * qty;
+          if (!best || qty > best.qty) best = { price, qty };
+        }
+        return { best, total };
+      };
+      const bids = pick(d.bids, (p) => p >= mid * 0.98);
+      const asks = pick(d.asks, (p) => p <= mid * 1.02);
+      ext.depth = { mid, bid: bids.best, ask: asks.best, bidUsd: bids.total, askUsd: asks.total };
+      ext.depthStatus = "ok";
+    } catch (err) {
+      if (token !== ext.extrasToken) return;
+      console.warn("Depth not available", err);
+      ext.depth = null; ext.depthStatus = "na";
+    }
+    renderDepth();
+  }
+  function renderDepth() {
+    const b = $("roBidWall"), a = $("roAskWall"), im = $("roDepthImb");
+    if (!b) return;
+    const d = ext.depth;
+    if (!d) { const t = ext.depthStatus === "loading" ? "…" : "not available"; b.textContent = a.textContent = im.textContent = t; return; }
+    const fmtWall = (w) => w ? fmtPrice(w.price) + " · " + fmtVol(w.qty) + " (" + ((w.price / d.mid - 1) * 100).toFixed(2) + "%)" : "—";
+    b.textContent = fmtWall(d.bid);
+    a.textContent = fmtWall(d.ask);
+    const tot = d.bidUsd + d.askUsd;
+    im.textContent = "bids $" + fmtVol(d.bidUsd) + " / asks $" + fmtVol(d.askUsd) + (tot ? " (" + Math.round((d.bidUsd / tot) * 100) + "% bid)" : "");
+  }
+
+  function startExtras() {
+    ext.extrasToken += 1;
+    const token = ext.extrasToken;
+    ext.funding = ext.oi = ext.depth = null;
+    ext.derivStatus = ext.depthStatus = "loading";
+    renderDerivs(); renderDepth();
+    const run = () => { if (document.visibilityState !== "hidden") { refreshDerivs(token); refreshDepth(token); } };
+    run();
+    if (ext.extrasTimer) clearInterval(ext.extrasTimer);
+    ext.extrasTimer = setInterval(run, EXTRAS_REFRESH_MS);
+  }
+
+  // ── Backtest engine (educational) ──
+  const STRATEGIES = {
+    smaema: "SMA20 / EMA50 cross",
+    rsi: "RSI 30/70 reversion",
+    macd: "MACD / signal cross",
+    bbsq: "Bollinger squeeze breakout",
+    vwap: "VWAP reclaim",
+  };
+
+  // Returns array of +1 (long entry / short exit), -1 (short entry / long exit), 0. Uses bar i close only.
+  function strategySignals(key, candles, interval) {
+    const n = candles.length;
+    const closes = candles.map((c) => c.close);
+    const sig = new Array(n).fill(0);
+    const crossUp = (a, b, i) => a[i - 1] != null && b[i - 1] != null && a[i] != null && b[i] != null && a[i - 1] <= b[i - 1] && a[i] > b[i];
+    const crossDn = (a, b, i) => a[i - 1] != null && b[i - 1] != null && a[i] != null && b[i] != null && a[i - 1] >= b[i - 1] && a[i] < b[i];
+    if (key === "smaema") {
+      const s = sma(closes, 20), e = ema(closes, 50);
+      for (let i = 1; i < n; i++) sig[i] = crossUp(s, e, i) ? 1 : crossDn(s, e, i) ? -1 : 0;
+    } else if (key === "rsi") {
+      const r = rsi(closes, 14);
+      for (let i = 1; i < n; i++) {
+        if (r[i - 1] == null || r[i] == null) continue;
+        if (r[i - 1] < 30 && r[i] >= 30) sig[i] = 1;
+        else if (r[i - 1] > 70 && r[i] <= 70) sig[i] = -1;
+      }
+    } else if (key === "macd") {
+      const m = macd(closes, 12, 26, 9);
+      for (let i = 1; i < n; i++) sig[i] = crossUp(m.macdLine, m.signalLine, i) ? 1 : crossDn(m.macdLine, m.signalLine, i) ? -1 : 0;
+    } else if (key === "bbsq") {
+      const b = bollinger(closes, 20, 2);
+      for (let i = 120; i < n; i++) {
+        const hist = b.bw.slice(i - 120, i).filter((x) => x != null).sort((x, y) => x - y);
+        if (hist.length < 50) continue;
+        const p20 = hist[Math.floor(hist.length * 0.2)];
+        let squeezed = false;
+        for (let j = i - 5; j < i; j++) if (b.bw[j] != null && b.bw[j] <= p20) squeezed = true;
+        if (!squeezed) continue;
+        if (closes[i] > b.up[i]) sig[i] = 1;
+        else if (closes[i] < b.lo[i]) sig[i] = -1;
+      }
+    } else if (key === "vwap") {
+      const v = vwapSeriesCalc(candles, interval);
+      for (let i = 1; i < n; i++) sig[i] = crossUp(closes, v, i) ? 1 : crossDn(closes, v, i) ? -1 : 0;
+    }
+    return sig;
+  }
+
+  // Simulate trades whose entries fall in [start, end). Entry at next bar open after signal.
+  // ATR stop/target checked intrabar; if both hit in one bar we assume the stop (conservative).
+  function simulate(candles, sig, atr, opts, start, end) {
+    const trades = [];
+    let pos = null;
+    let equity = 1, peak = 1, maxDd = 0;
+    const curve = [];
+    const closeTrade = (i, price, reason) => {
+      const gross = pos.dir * (price - pos.entry) / pos.entry;
+      const net = (1 + gross) * (1 - FEE) / (1 + FEE) - 1; // fee on entry & exit notional
+      equity = pos.eqAtEntry * (1 + net);
+      trades.push({ dir: pos.dir, entryTime: candles[pos.i].time, exitTime: candles[i].time, entry: pos.entry, exit: price, ret: net, reason });
+      pos = null;
+    };
+    for (let i = start; i < end; i++) {
+      const c = candles[i];
+      if (pos) {
+        const hitStop = pos.dir > 0 ? c.low <= pos.stop : c.high >= pos.stop;
+        const hitTgt = pos.dir > 0 ? c.high >= pos.target : c.low <= pos.target;
+        if (hitStop) {
+          const px = pos.dir > 0 ? Math.min(c.open, pos.stop) : Math.max(c.open, pos.stop); // gap-through fills at open
+          closeTrade(i, px, "stop");
+        } else if (hitTgt) {
+          const px = pos.dir > 0 ? Math.max(c.open, pos.target) : Math.min(c.open, pos.target);
+          closeTrade(i, px, "target");
+        }
+      }
+      // mark to market
+      const mtm = pos ? pos.eqAtEntry * (1 + pos.dir * (c.close - pos.entry) / pos.entry) * (1 - FEE) : equity;
+      if (mtm > peak) peak = mtm;
+      maxDd = Math.max(maxDd, 1 - mtm / peak);
+      curve.push({ time: c.time, value: mtm });
+
+      if (i === end - 1) { if (pos) closeTrade(i, c.close, "end"); break; }
+      const s = sig[i];
+      if (!s) continue;
+      const next = candles[i + 1];
+      // opposite signal exits at next open
+      if (pos && s === -pos.dir) closeTrade(i + 1, next.open, "signal");
+      if (!pos && atr[i] != null && (s === 1 || (s === -1 && opts.allowShort))) {
+        const entry = next.open;
+        pos = {
+          dir: s, i: i + 1, entry, eqAtEntry: equity,
+          stop: entry - s * opts.stopMult * atr[i],
+          target: entry + s * opts.targetMult * atr[i],
+        };
+      }
+    }
+    const wins = trades.filter((t) => t.ret > 0), losses = trades.filter((t) => t.ret <= 0);
+    const gw = wins.reduce((s, t) => s + t.ret, 0), gl = -losses.reduce((s, t) => s + t.ret, 0);
+    const first = candles[start], last = candles[end - 1];
+    const bh = (last.close / first.open) * (1 - FEE) / (1 + FEE) - 1;
+    return {
+      trades, curve,
+      count: trades.length,
+      winRate: trades.length ? wins.length / trades.length : 0,
+      net: equity - 1,
+      bh,
+      maxDd,
+      pf: gl > 0 ? gw / gl : (gw > 0 ? Infinity : 0),
+      avgWin: wins.length ? gw / wins.length : 0,
+      avgLoss: losses.length ? -gl / losses.length : 0,
+      from: first.time, to: last.time,
+    };
+  }
+
+  function runBacktest() {
+    const candles = state.candles.slice();
+    const out = $("btResults");
+    if (candles.length < 120) {
+      out.textContent = "Need at least 120 loaded candles (have " + candles.length + "). Wait for history to load.";
+      return;
+    }
+    const key = $("btStrategy").value;
+    const opts = {
+      allowShort: $("btShort").checked,
+      stopMult: Math.max(0.2, parseFloat($("btStop").value) || 1.5),
+      targetMult: Math.max(0.2, parseFloat($("btTarget").value) || 3),
+    };
+    const sig = strategySignals(key, candles, state.interval);
+    const atr = atrSeries(candles, 14);
+    const warm = 50; // skip indicator warm-up
+    const full = simulate(candles, sig, atr, opts, warm, candles.length);
+    const mid = Math.floor((warm + candles.length) / 2);
+    const isR = simulate(candles, sig, atr, opts, warm, mid);
+    const oosR = simulate(candles, sig, atr, opts, mid, candles.length);
+    ext.lastBacktest = { key, name: STRATEGIES[key], opts, full, isR, oosR, symbol: state.symbol, interval: state.interval, bars: candles.length - warm };
+    renderBacktest();
+  }
+
+  const pctS = (x) => (x >= 0 ? "+" : "") + (x * 100).toFixed(2) + "%";
+  const pfS = (x) => (x === Infinity ? "∞" : x.toFixed(2));
+
+  function renderBacktest() {
+    const bt = ext.lastBacktest;
+    const out = $("btResults");
+    out.innerHTML = "";
+    if (!bt) return;
+    const r = bt.full;
+    const add = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; e.textContent = text; out.appendChild(e); return e; };
+    add("div", "bt-meta", bt.name + " · " + bt.symbol + " " + bt.interval + " · " + bt.bars + " bars · " + (bt.opts.allowShort ? "long+short" : "long only") + " · stop " + bt.opts.stopMult + "×ATR / target " + bt.opts.targetMult + "×ATR · 0.1% fee/side");
+    const grid = add("div", "bt-grid", "");
+    const stat = (label, val, cls) => {
+      const d = document.createElement("div"); d.className = "bt-stat";
+      const l = document.createElement("span"); l.textContent = label;
+      const v = document.createElement("strong"); v.textContent = val; if (cls) v.className = cls;
+      d.append(l, v); grid.appendChild(d);
+    };
+    const pn = (x) => (x > 0 ? "pos" : x < 0 ? "neg" : "");
+    stat("Trades", String(r.count));
+    stat("Win rate", r.count ? (r.winRate * 100).toFixed(1) + "%" : "—");
+    stat("Net return", pctS(r.net), pn(r.net));
+    stat("Buy & hold", pctS(r.bh), pn(r.bh));
+    stat("vs B&H", pctS(r.net - r.bh), pn(r.net - r.bh));
+    stat("Max drawdown", "-" + (r.maxDd * 100).toFixed(2) + "%", "neg");
+    stat("Profit factor", r.count ? pfS(r.pf) : "—");
+    stat("Avg win / loss", r.count ? pctS(r.avgWin) + " / " + pctS(r.avgLoss) : "—");
+
+    if (r.count < 30) {
+      add("div", "bt-warn", "⚠ Only " + r.count + " trade" + (r.count === 1 ? "" : "s") + ". Under ~30 trades the stats are dominated by luck; win rate and profit factor can swing wildly with a few trades. Treat this as anecdotal, not evidence.");
+    }
+    const split = add("div", "bt-split", "");
+    const row = (label, x) => {
+      const d = document.createElement("div");
+      d.textContent = label + ": " + x.count + " trades · net " + pctS(x.net) + " vs B&H " + pctS(x.bh) + " · win " + (x.count ? (x.winRate * 100).toFixed(0) + "%" : "—") + " · PF " + (x.count ? pfS(x.pf) : "—") + " · maxDD -" + (x.maxDd * 100).toFixed(1) + "%";
+      split.appendChild(d);
+    };
+    const h = document.createElement("strong"); h.textContent = "In-sample / out-of-sample split"; split.appendChild(h);
+    row("1st half (in-sample)", bt.isR);
+    row("2nd half (out-of-sample)", bt.oosR);
+    const consistent = Math.sign(bt.isR.net - bt.isR.bh) === Math.sign(bt.oosR.net - bt.oosR.bh);
+    const note = document.createElement("em");
+    note.textContent = consistent
+      ? "Both halves point the same way vs buy-and-hold — still not proof; one market regime, one symbol."
+      : "Halves disagree — a sign the edge (if any) is unstable / regime-dependent.";
+    split.appendChild(note);
+    add("p", "bt-disclaimer", "Hypothetical, educational backtest on " + bt.bars + " recent candles. Ignores slippage, funding, liquidity and partial fills; entries at next-bar open, stop assumed first when stop and target hit in the same bar. Past results do not guarantee future results. Not financial advice.");
+
+    // equity curve
+    if (!ext.eqChart) {
+      ext.eqChart = LightweightCharts.createChart($("btEquity"), {
+        ...CHART_OPTS,
+        height: 140,
+        rightPriceScale: { borderColor: "#2a313c" },
+        timeScale: { ...CHART_OPTS.timeScale, timeVisible: false },
+        handleScroll: false, handleScale: false,
+      });
+      ext.eqSeries = ext.eqChart.addLineSeries({ color: "#2962ff", lineWidth: 2, priceLineVisible: false, title: "Strategy" });
+      ext.bhSeries = ext.eqChart.addLineSeries({ color: "rgba(139,149,165,0.6)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: "B&H" });
+    }
+    $("btEquityWrap").hidden = false;
+    const eqEl = $("btEquity");
+    ext.eqChart.applyOptions({ width: eqEl.clientWidth || 300, height: 140 });
+    ext.eqSeries.setData(r.curve.map((p) => ({ time: p.time, value: p.value * 100 })));
+    const o = state.candles[50] ? state.candles[50].open : r.curve[0].value;
+    ext.bhSeries.setData(state.candles.slice(50).map((c) => ({ time: c.time, value: (c.close / o) * 100 })));
+    ext.eqChart.timeScale().fitContent();
+
+    // trade markers on main chart
+    const markers = [];
+    for (const t of r.trades) {
+      markers.push({ time: t.entryTime, position: t.dir > 0 ? "belowBar" : "aboveBar", color: t.dir > 0 ? "#0ecb81" : "#f6465d", shape: t.dir > 0 ? "arrowUp" : "arrowDown", text: r.trades.length <= 40 ? (t.dir > 0 ? "L" : "S") : "" });
+      markers.push({ time: t.exitTime, position: t.dir > 0 ? "aboveBar" : "belowBar", color: t.ret > 0 ? "#0ecb81" : "#f6465d", shape: "circle", text: r.trades.length <= 40 ? (t.ret * 100).toFixed(1) + "%" : "" });
+    }
+    markers.sort((a, b) => a.time - b.time);
+    candleSeries.setMarkers(markers);
+  }
+
+  function clearBacktest() {
+    ext.lastBacktest = null;
+    if (candleSeries) candleSeries.setMarkers([]);
+    const out = $("btResults");
+    if (out) out.textContent = "Pick a strategy and press Run. Results are hypothetical and educational.";
+    const w = $("btEquityWrap");
+    if (w) w.hidden = true;
+  }
+
+  function bindExtUi() {
+    $("btRun").addEventListener("click", runBacktest);
+    $("btClear").addEventListener("click", clearBacktest);
+    $("labToggle").addEventListener("click", () => {
+      const lab = $("labPanel");
+      const open = lab.hidden;
+      lab.hidden = !open;
+      $("labToggle").classList.toggle("active", open);
+      $("labToggle").setAttribute("aria-pressed", String(open));
+      document.body.classList.toggle("lab-open", open);
+      requestAnimationFrame(() => { resizeCharts(); scheduleVolumeProfile(); });
+    });
+    const sel = $("btStrategy");
+    Object.entries(STRATEGIES).forEach(([k, v]) => { const o = document.createElement("option"); o.value = k; o.textContent = v; sel.appendChild(o); });
+    window.addEventListener("resize", () => {
+      scheduleVolumeProfile();
+      if (ext.eqChart && $("btEquity").clientWidth) ext.eqChart.applyOptions({ width: $("btEquity").clientWidth });
+    });
+    clearBacktest();
+  }
+
+  // ── Co-pilot additions ──
+  function extAnalysis() {
+    const candles = state.candles;
+    const closes = candles.map((c) => c.close);
+    const b = bollinger(closes, 20, 2);
+    const ub = lastDefined(b.up), lb = lastDefined(b.lo), bw = lastDefined(b.bw);
+    let bwPct = null;
+    if (bw) {
+      const hist = b.bw.slice(-120).filter((x) => x != null);
+      bwPct = hist.filter((x) => x <= bw.value).length / hist.length;
+    }
+    const v = lastDefined(vwapSeriesCalc(candles, state.interval));
+    const atr = lastDefined(atrSeries(candles, 14));
+    return {
+      bbUpper: ub ? ub.value : null, bbLower: lb ? lb.value : null, bbWidthPctile: bwPct,
+      vwap: v ? v.value : null, atrW: atr ? atr.value : null,
+      funding: ext.funding, oi: ext.oi, derivStatus: ext.derivStatus,
+      depth: ext.depth, depthStatus: ext.depthStatus,
+      poc: state.indicators.vp ? ext.vpPoc : null,
+      backtest: ext.lastBacktest && ext.lastBacktest.symbol === state.symbol && ext.lastBacktest.interval === state.interval ? ext.lastBacktest : null,
+    };
+  }
+
+  function replyReadouts(a) {
+    const x = a.ext;
+    let t = "Extra readouts (" + a.symbol + " · " + a.interval + ")\n\n";
+    if (x.atrW != null) t += "• ATR(14): " + fmtPrice(x.atrW) + " (" + ((x.atrW / a.price) * 100).toFixed(2) + "% of price). A 1.5× ATR study stop would sit ~" + fmtPrice(1.5 * x.atrW) + " away — distance only, not a recommendation.\n";
+    if (x.vwap != null) t += "• VWAP" + (a.interval === "1d" ? " (rolling 20-bar on 1D)" : " (UTC-day session)") + ": " + fmtPrice(x.vwap) + " → price is " + (a.price >= x.vwap ? "above" : "below") + " it.\n";
+    if (x.bbUpper != null) {
+      t += "• Bollinger(20,2): " + fmtPrice(x.bbLower) + " – " + fmtPrice(x.bbUpper);
+      if (x.bbWidthPctile != null) t += "; band width is at the " + Math.round(x.bbWidthPctile * 100) + "th percentile of the last 120 bars" + (x.bbWidthPctile <= 0.2 ? " (a squeeze — volatility often expands after, direction unknown)" : "");
+      t += ".\n";
+    }
+    if (x.poc != null) t += "• Volume-profile point of control (visible range): ~" + fmtPrice(x.poc) + ".\n";
+    if (x.funding) {
+      const f = x.funding.rate * 100;
+      t += "• Funding: " + (f >= 0 ? "+" : "") + f.toFixed(4) + "% per 8h — " + (f > 0.03 ? "elevated positive: longs are paying up, crowded-long conditions are worth noting" : f < 0 ? "negative: shorts are paying longs" : "near neutral") + ".\n";
+    } else t += "• Funding: not available (" + (x.derivStatus === "loading" ? "loading" : "futures endpoint blocked/unsupported for this pair") + ").\n";
+    if (x.oi) t += "• Open interest: " + fmtVol(x.oi.qty) + " contracts (a snapshot; changes over time matter more than the level).\n";
+    else t += "• Open interest: not available.\n";
+    if (x.depth) {
+      const d = x.depth;
+      t += "• Order book ±2%: biggest bid wall " + (d.bid ? fmtPrice(d.bid.price) + " (" + fmtVol(d.bid.qty) + ")" : "—") + ", biggest ask wall " + (d.ask ? fmtPrice(d.ask.price) + " (" + fmtVol(d.ask.qty) + ")" : "—") + ". Walls can be pulled at any time (spoofing), so they are weak evidence.\n";
+    } else t += "• Order book: " + (x.depthStatus === "loading" ? "loading" : "not available") + ".\n";
+    return t + disclaimerFooter();
+  }
+
+  function replyBacktest(a) {
+    const bt = a.ext.backtest;
+    if (!bt) return "No backtest for " + a.symbol + " " + a.interval + " yet. Open the Lab panel (toolbar), pick a strategy and press Run, then ask again." + disclaimerFooter();
+    const r = bt.full;
+    let t = "Backtest recap: " + bt.name + " (" + bt.symbol + " " + bt.interval + ")\n\n";
+    t += r.count + " trades · win " + (r.count ? (r.winRate * 100).toFixed(0) + "%" : "—") + " · net " + pctS(r.net) + " vs buy & hold " + pctS(r.bh) + " · max DD -" + (r.maxDd * 100).toFixed(1) + "% · PF " + (r.count ? pfS(r.pf) : "—") + ".\n";
+    t += "In-sample " + pctS(bt.isR.net) + " (B&H " + pctS(bt.isR.bh) + ") vs out-of-sample " + pctS(bt.oosR.net) + " (B&H " + pctS(bt.oosR.bh) + ").\n\n";
+    if (r.count < 30) t += "With fewer than 30 trades this is closer to an anecdote than a statistic.\n";
+    if (r.net < r.bh) t += "The rule underperformed simply holding over this window — a common outcome once fees are included.\n";
+    t += "Backtests on one symbol and ~1000 bars are easy to overfit; changing stop/target until it looks good is curve-fitting.";
+    return t + disclaimerFooter();
+  }
+
   // ── Events ──────────────────────────────────────────────────────────────
   function bindUi() {
     els.symbolSelect.value = state.symbol;
@@ -1195,6 +1793,8 @@
         project: "Project next few candles (hypothetical)",
         explain: "Explain RSI/MACD on this chart",
         invalidate: "What would invalidate this move?",
+        readouts: "Read the new data (ATR, VWAP, BB, funding, OI, depth)",
+        backtest: "Summarize my backtest",
       };
       const q = map[btn.dataset.prompt] || btn.textContent;
       setCopilotOpen(true);
@@ -1251,6 +1851,7 @@
     createCharts();
     updatePaneVisibility();
     bindUi();
+    bindExtUi();
     renderNotes();
 
     const params = new URLSearchParams(location.search);
